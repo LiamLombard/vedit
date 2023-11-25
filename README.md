@@ -12,7 +12,10 @@ We also mask part of the screen which we want to ignore when considering duplica
 ## Building the executable
 
 ```
-pyinstaller --noconsole --onefile .\gui.py
+python -m venv .venv
+# activate the venv for your platform
+pip install pyinstaller Pillow
+pyinstaller --noconsole --onefile gui.py
 ```
 
 Will save an exe to the dist directory.
