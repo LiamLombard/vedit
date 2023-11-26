@@ -26,7 +26,12 @@ class System:
         self.original_stderr: TextIO = sys.stderr
         self.out_stream: TextIOWrapper = sys.stdout
         self.config_file: Path = config_file or Path("config.toml")
-        self.config = Config(**tomllib.loads(self.config_file.read_text()))
+
+        if self.config_file.exists():
+            self.config = Config(**tomllib.loads(self.config_file.read_text()))
+        else:
+            self.config = Config()
+
         self.log_dir: Path = Path.cwd() / "logs"
 
     def new_logfile(self) -> None:
@@ -146,7 +151,7 @@ class System:
                 [
                     "split=2[full][masked]",
                     "[masked]drawbox=w=iw*0.2:h=ih:x=0:y=0:t=fill:c=white,drawbox=w=iw:h=ih*0.2:x=0:y=ih*0.8:t=fill:c=white,mpdecimate[deduped]",
-                    "[deduped][full]overlay=shortest=1",
+                    "[deduped][full]overlay=shortest=1,setpts=N/FRAME_RATE/TB",
                 ],
             ),
             "-an",
@@ -229,12 +234,13 @@ class FileProcessorApp:
             case ("step", step):
                 self.step(step)
             case ("done", output_path):
-                self.file_path_label.config(
-                    text=f"File processed and saved as: {output_path}"
-                )
                 self.processing_thread.join()
                 self.processing_thread = None
                 self.selected_file_path = None
+                self.file_path_label.config(
+                    text=f"File processed and saved as: {output_path}"
+                )
+                self.root.update()
                 return
             case None:
                 pass

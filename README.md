@@ -1,4 +1,4 @@
-# Video speedup
+# Video speedup gui
 
 Simple windows based gui (could work on linux too - but haven't tested) thrown together to automate a simple pre-canned video editing process, where duplicate frames are cut and the video is sped up. This was built specifically for the sims 4 footage.
 
@@ -11,6 +11,7 @@ We also mask part of the screen which we want to ignore when considering duplica
 
 ## Building the executable
 
+Note - requires python 3.11
 ```
 python -m venv .venv
 # activate the venv for your platform
@@ -26,6 +27,8 @@ Will save an exe to the dist directory.
 Log files stored in same directory as the executable
 
 The output video will be placed in the same directory as the input file with "_processed" appended to the name.
+
+You will require ffmpeg to be available in your path for this to work.
 
 Tested on mkv files, no idea if it'll handle mp4 files.
 
