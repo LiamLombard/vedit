@@ -28,3 +28,7 @@ Log files stored in same directory as the executable
 The output video will be placed in the same directory as the input file with "_processed" appended to the name.
 
 Tested on mkv files, no idea if it'll handle mp4 files.
+
+a config.toml file can be placed in the same directory as the executable where you can set the following options:
+* vid_split_secs: how long the split videos should be (to combat out of memory issues)
+* speed_multiplier: how much the output video should be sped up by
