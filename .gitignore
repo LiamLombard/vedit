@@ -6,3 +6,4 @@ build
 vids
 logs
 config.toml
+*.spec

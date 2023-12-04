@@ -11,13 +11,29 @@ from io import TextIOWrapper
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from tkinter import filedialog, ttk
-from typing import TextIO
+import traceback
+from typing import Iterator, Self, TextIO
 
 
 @dataclass(frozen=True)
 class Config:
     video_split_secs: int = 60
     speed_multiplier: int = 6
+
+    @staticmethod
+    def load(config_file: Path | None = None) -> Self:
+        config_file: Path = config_file or Path("config.toml")
+
+        if config_file.exists():
+            config = Config(**tomllib.loads(config_file.read_text()))
+        else:
+            config = Config()
+            default_toml = "\n".join(
+                f"{key} = {value}" for key, value in asdict(config).items()
+            )
+            config_file.write_text(default_toml)
+
+        return config
 
 
 def parse_filename(p: Path) -> datetime:
@@ -35,21 +51,11 @@ def parse_filename(p: Path) -> datetime:
     raise RuntimeError("Could not get a meaningful value to order video files by")
 
 
-class System:
-    def __init__(self, config_file: Path | None = None) -> None:
+class Logger:
+    def __init__(self) -> None:
         self.original_stdout: TextIO = sys.stdout
         self.original_stderr: TextIO = sys.stderr
         self.out_stream: TextIOWrapper = sys.stdout
-        self.config_file: Path = config_file or Path("config.toml")
-
-        if self.config_file.exists():
-            self.config = Config(**tomllib.loads(self.config_file.read_text()))
-        else:
-            self.config = Config()
-            default_toml = "\n".join(
-                f"{key} = {value}" for key, value in asdict(self.config).items()
-            )
-            self.config_file.write_text(default_toml)
 
         self.log_dir: Path = Path.cwd() / "logs"
 
@@ -71,64 +77,28 @@ class System:
         self.out_stream.write("\n")
         self.out_stream.flush()
 
+    def exception(self, s: str) -> None:
+        self.writeline(s)
+        traceback.print_exc()
+
+
+class FFmpeg:
     def ffmpeg(self, *args: str) -> None:
         cmd = ["ffmpeg", *args]
-        self.writeline(f"Running command: {' '.join(cmd)}")
+        logger.writeline(f"Running command: {' '.join(cmd)}")
 
         res = subprocess.run(
             args=cmd,
-            stdout=self.out_stream,
-            stderr=self.out_stream,
+            stdout=logger.out_stream,
+            stderr=logger.out_stream,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
         res.check_returncode()
-        self.writeline("ffmpeg finished successfully!")
+        logger.writeline("ffmpeg finished successfully!")
 
-    def process_dir(self, selected_dir: Path, message_queue: Queue) -> None:
-        self.make_new_logfile()
-
-        output_path = selected_dir / "processed.mkv"
-
-        files_to_process = sorted(selected_dir.glob("*.mkv"), key=parse_filename)
-
-        n_digits = len(str(len(files_to_process))) + 1
-
-        with TemporaryDirectory() as tmp_path:
-            tmp_path = Path(tmp_path)
-            tmp_path.mkdir(parents=True, exist_ok=True)
-
-            message_queue.put(("step", 0, "Splitting video files into chunks"))
-            files: list[Path] = []
-            for i, video_file in enumerate(files_to_process):
-                split_files = self.ffmpeg_split(
-                    video_file, tmp_path=tmp_path, prefix=f"{i:0{n_digits}}"
-                )
-                files.extend(split_files)
-
-            step = 100 / (len(files) + 2)
-            message_queue.put(("step", 0, "Starting to process files"))
-
-            processed_paths = []
-            for i, file in enumerate(files):
-                message_queue.put(
-                    (
-                        "step",
-                        step,
-                        f"Processing: {file.as_posix()} ({i+1}/{len(files)})",
-                    )
-                )
-                processed_paths.append(self.ffmpeg_edit(file))
-
-            message_queue.put(("step", 0, "Merging files"))
-            self.ffmpeg_combine_and_speedup(
-                processed_paths, output_path=output_path, tmp_path=tmp_path
-            )
-            message_queue.put(("step", step, "Merging Complete"))
-
-        message_queue.put(("done", output_path))
-
-    def ffmpeg_split(self, in_file: Path, tmp_path: Path, prefix: str) -> list[Path]:
-        seconds = self.config.video_split_secs
+    def split(
+        self, in_file: Path, tmp_path: Path, seconds: int, prefix: str = ""
+    ) -> list[Path]:
         self.ffmpeg(
             "-y",
             "-i",
@@ -143,13 +113,14 @@ class System:
             "segment",
             "-reset_timestamps",
             "1",
-            tmp_path.joinpath(f"{prefix}_%04d{in_file.suffix}").as_posix(),
+            tmp_path.joinpath(f"{prefix}%04d{in_file.suffix}").as_posix(),
         )
-        return list(tmp_path.glob(f"*{in_file.suffix}"))
+        return sorted(tmp_path.glob(f"{prefix}*{in_file.suffix}"), key=lambda f: f.name)
 
-    def ffmpeg_combine_and_speedup(
+    def combine_and_speedup(
         self,
         processed_paths: list[Path],
+        speed_multiplier: int,
         output_path: Path,
         tmp_path: Path,
     ) -> Path:
@@ -167,15 +138,14 @@ class System:
             "-i",
             concat_file.as_posix(),
             "-vf",
-            f"setpts={1/self.config.speed_multiplier}*PTS",
+            f"setpts={1/speed_multiplier}*PTS",
             "-an",
             output_path.as_posix(),
         )
         return output_path
 
-    def ffmpeg_edit(self, in_file: Path) -> Path:
+    def dedupe(self, in_file: Path) -> Path:
         output_path = in_file.parent / f"{in_file.stem}_processed{in_file.suffix}"
-
         self.ffmpeg(
             "-y",
             "-i",
@@ -191,13 +161,88 @@ class System:
             "-an",
             output_path.as_posix(),
         )
-
         return output_path
+
+    def edit(
+        self, in_file: Path, seconds: int, min_split_time: int = 1, n_splits: int = 2
+    ) -> Iterator[Path]:
+        """Handles the main deduplication logic for a file.
+
+        This is an error prone action, where we often run out of memory while trying to process 4K video.
+        To try and mitigate we split file into `n_splits` for every failure and try again.
+        Down to a minimum of 1 second per split file.
+        """
+        try:
+            yield self.dedupe(in_file=in_file)
+            return
+        except subprocess.CalledProcessError:
+            logger.exception("Failed to process file - probably ran out of memory.")
+
+        new_time = seconds // n_splits
+        logger.writeline(f"Splitting file length down to {new_time} and retrying...")
+
+        if new_time < min_split_time:
+            raise RuntimeError(
+                "Something has gone wrong, we couldn't process very short videos."
+            )
+
+        files = self.split(
+            in_file, in_file.parent, seconds=new_time, prefix=f"{in_file.name}_"
+        )
+        for file in files:
+            yield from self.edit(in_file=file, seconds=new_time)
+
+
+def process_dir(selected_dir: Path, message_queue: Queue) -> None:
+    config = Config.load()
+    ffmpeg = FFmpeg()
+
+    logger.make_new_logfile()
+
+    output_path = selected_dir / "processed.mkv"
+
+    files_to_process = sorted(selected_dir.glob("*.mkv"), key=parse_filename)
+
+    n_digits = len(str(len(files_to_process))) + 1
+
+    with TemporaryDirectory() as tmp_path:
+        tmp_path = Path(tmp_path)
+        tmp_path.mkdir(parents=True, exist_ok=True)
+
+        message_queue.put(("step", 0, "Splitting video files into chunks"))
+        files: list[Path] = []
+        for i, video_file in enumerate(files_to_process):
+            split_files = ffmpeg.split(
+                video_file,
+                tmp_path=tmp_path,
+                seconds=config.video_split_secs,
+                prefix=f"{i:0{n_digits}}_",
+            )
+            files.extend(split_files)
+
+        step = 100 / (len(files) + 2)
+        message_queue.put(("step", step, "Starting to process files"))
+
+        processed_paths = []
+        for i, file in enumerate(files):
+            msg = f"Processing: {file.as_posix()} ({i+1}/{len(files)})"
+            message_queue.put(("step", step, msg))
+            processed_paths.extend(ffmpeg.edit(file, seconds=config.video_split_secs))
+
+        message_queue.put(("step", 0, "Merging/Speeding up files"))
+        ffmpeg.combine_and_speedup(
+            processed_paths,
+            speed_multiplier=config.speed_multiplier,
+            output_path=output_path,
+            tmp_path=tmp_path,
+        )
+        message_queue.put(("step", step, "Merging Complete"))
+
+    message_queue.put(("done", output_path))
 
 
 class FileProcessorApp:
-    def __init__(self, root: tk.Tk, system: System):
-        self.system = system
+    def __init__(self, root: tk.Tk):
         self.message_queue = Queue()
         self.selected_file_path: Path | None = None
 
@@ -249,7 +294,7 @@ class FileProcessorApp:
         self.message_queue = Queue()
 
         self.processing_thread = Thread(
-            target=self.system.process_dir,
+            target=process_dir,
             args=(self.selected_file_path, self.message_queue),
             daemon=True,
         )
@@ -309,8 +354,8 @@ if __name__ == "__main__":
 
         windll.shcore.SetProcessDpiAwareness(1)
 
-    system = System()
+    logger = Logger()
 
     root = tk.Tk()
-    app = FileProcessorApp(root, system)
+    app = FileProcessorApp(root)
     app.run()

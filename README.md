@@ -2,7 +2,7 @@
 
 Simple windows based gui (could work on linux too - but haven't tested) thrown together to automate a simple pre-canned video editing process, where duplicate frames are cut and the video is sped up. This was built specifically for the sims 4 footage.
 
-This works by splitting a given video file into many, doing the necessary processing and merging them all back together, then applying a speed modifier.
+This works by splitting a given directory of video files into chunks, doing frame deduplication then merging them all back together, applying a speed modifier.
 
 Splitting up the video into parts avoids running out of memory (there is likely a way to get around this natively in ffmpeg but I havent found it yet).
 
@@ -15,7 +15,7 @@ Note - requires python 3.11
 ```
 python -m venv .venv
 # activate the venv for your platform
-pip install pyinstaller Pillow
+pip install pyinstaller
 pyinstaller --noconsole --onefile gui.py
 ```
 
