@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import os
 from queue import Queue, Empty
 import subprocess
@@ -16,8 +16,23 @@ from typing import TextIO
 
 @dataclass(frozen=True)
 class Config:
-    vid_split_secs: int = 60
+    video_split_secs: int = 60
     speed_multiplier: int = 6
+
+
+def parse_filename(p: Path) -> datetime:
+    parsing_options = [
+        lambda: datetime.strptime(p.stem, "%Y-%m-%d %H-%M-%S"),
+        lambda: datetime.fromisoformat(p.stem),
+        lambda: p.stat().st_mtime,
+    ]
+    for parse_attempt in parsing_options:
+        try:
+            return parse_attempt()
+        except Exception:
+            pass
+
+    raise RuntimeError("Could not get a meaningful value to order video files by")
 
 
 class System:
@@ -31,10 +46,14 @@ class System:
             self.config = Config(**tomllib.loads(self.config_file.read_text()))
         else:
             self.config = Config()
+            default_toml = "\n".join(
+                f"{key} = {value}" for key, value in asdict(self.config).items()
+            )
+            self.config_file.write_text(default_toml)
 
         self.log_dir: Path = Path.cwd() / "logs"
 
-    def new_logfile(self) -> None:
+    def make_new_logfile(self) -> None:
         if not self.log_dir.exists():
             self.log_dir.mkdir(parents=True, exist_ok=True)
         now = datetime.now().strftime("%Y-%m-%dT%H%M%S")
@@ -65,36 +84,51 @@ class System:
         res.check_returncode()
         self.writeline("ffmpeg finished successfully!")
 
-    def process_file(self, selected_file: Path, message_queue: Queue) -> None:
-        self.new_logfile()
+    def process_dir(self, selected_dir: Path, message_queue: Queue) -> None:
+        self.make_new_logfile()
 
-        output_path = (
-            selected_file.parent
-            / f"{selected_file.stem}_processed{selected_file.suffix}"
-        )
+        output_path = selected_dir / "processed.mkv"
+
+        files_to_process = sorted(selected_dir.glob("*.mkv"), key=parse_filename)
+
+        n_digits = len(str(len(files_to_process))) + 1
 
         with TemporaryDirectory() as tmp_path:
             tmp_path = Path(tmp_path)
             tmp_path.mkdir(parents=True, exist_ok=True)
-            files = self.ffmpeg_split(selected_file, tmp_path=tmp_path)
+
+            message_queue.put(("step", 0, "Splitting video files into chunks"))
+            files: list[Path] = []
+            for i, video_file in enumerate(files_to_process):
+                split_files = self.ffmpeg_split(
+                    video_file, tmp_path=tmp_path, prefix=f"{i:0{n_digits}}"
+                )
+                files.extend(split_files)
 
             step = 100 / (len(files) + 2)
-            message_queue.put(("step", step))
+            message_queue.put(("step", 0, "Starting to process files"))
 
             processed_paths = []
-            for file in files:
+            for i, file in enumerate(files):
+                message_queue.put(
+                    (
+                        "step",
+                        step,
+                        f"Processing: {file.as_posix()} ({i+1}/{len(files)})",
+                    )
+                )
                 processed_paths.append(self.ffmpeg_edit(file))
-                message_queue.put(("step", step))
 
+            message_queue.put(("step", 0, "Merging files"))
             self.ffmpeg_combine_and_speedup(
                 processed_paths, output_path=output_path, tmp_path=tmp_path
             )
-            message_queue.put(("step", step))
+            message_queue.put(("step", step, "Merging Complete"))
 
-        message_queue.put("done")
+        message_queue.put(("done", output_path))
 
-    def ffmpeg_split(self, in_file: Path, tmp_path: Path) -> Path:
-        seconds = self.config.vid_split_secs
+    def ffmpeg_split(self, in_file: Path, tmp_path: Path, prefix: str) -> list[Path]:
+        seconds = self.config.video_split_secs
         self.ffmpeg(
             "-y",
             "-i",
@@ -109,7 +143,7 @@ class System:
             "segment",
             "-reset_timestamps",
             "1",
-            tmp_path.joinpath(f"%03d{in_file.suffix}").as_posix(),
+            tmp_path.joinpath(f"{prefix}_%04d{in_file.suffix}").as_posix(),
         )
         return list(tmp_path.glob(f"*{in_file.suffix}"))
 
@@ -170,24 +204,27 @@ class FileProcessorApp:
         self.root = root
         self.root.title("Video Processor")
 
-        self.file_path_label = tk.Label(root, text="Selected File:")
+        self.file_path_label = tk.Label(root, text="Selected Folder:")
         self.file_path_label.pack(pady=10)
 
         self.select_button = tk.Button(
-            root, text="Select File", command=self.select_file
+            root, text="Select Folder", command=self.select_file
         )
         self.select_button.pack(pady=10)
 
         self.process_button = tk.Button(
-            root, text="Process File", command=self.process_file
+            root, text="Process Folder", command=self.process_folder
         )
         self.process_button.pack(pady=10)
         self.process_button.config(state=tk.DISABLED)
 
         self.progress_bar = ttk.Progressbar(
-            root, orient="horizontal", length=400, mode="determinate"
+            root, orient="horizontal", length=650, mode="determinate"
         )
         self.progress_bar.pack(pady=10)
+
+        self.status_label = tk.Label(root, text="")
+        self.status_label.pack(pady=10)
 
         self.processing_thread: Thread | None = None
 
@@ -196,25 +233,28 @@ class FileProcessorApp:
         self.root.update()
 
     def select_file(self):
-        file_path = filedialog.askopenfilename()
-        self.file_path_label.config(text=f"Selected File: {file_path}")
+        file_path = filedialog.askdirectory()
+        self.file_path_label.config(text=f"Selected Folder: {file_path}")
         self.selected_file_path = Path(file_path)
         self.process_button.config(state=tk.NORMAL)
 
-    def process_file(self) -> None:
+    def process_folder(self) -> None:
         if not self.selected_file_path:
-            self.file_path_label.config(text="Please select a file first.")
+            self.file_path_label.config(text="Please select a folder first.")
             return
         if self.processing_thread is not None:
             return
 
-        self.message_queue = Queue()  # make sure this queue is clear
+        # Make sure the queue is clear by overwriting it.
+        self.message_queue = Queue()
+
         self.processing_thread = Thread(
-            target=self.system.process_file,
+            target=self.system.process_dir,
             args=(self.selected_file_path, self.message_queue),
             daemon=True,
         )
         self.processing_thread.start()
+
         self.process_button.config(state=tk.DISABLED)
         self.root.after(1000, self.check_progress)
 
@@ -231,8 +271,9 @@ class FileProcessorApp:
             message = None
 
         match message:
-            case ("step", step):
+            case ("step", step, message):
                 self.step(step)
+                self.status_label.config(text=message)
             case ("done", output_path):
                 self.processing_thread.join()
                 self.processing_thread = None
@@ -240,6 +281,7 @@ class FileProcessorApp:
                 self.file_path_label.config(
                     text=f"File processed and saved as: {output_path}"
                 )
+                self.status_label.config(text="Done!")
                 self.root.update()
                 return
             case None:
@@ -247,6 +289,7 @@ class FileProcessorApp:
             case _:
                 raise RuntimeError("Unknown response from processing process")
 
+        self.root.update()
         self.root.after(1000, self.check_progress)
 
     def run(self):
@@ -267,7 +310,7 @@ if __name__ == "__main__":
         windll.shcore.SetProcessDpiAwareness(1)
 
     system = System()
-    root = tk.Tk()
 
+    root = tk.Tk()
     app = FileProcessorApp(root, system)
     app.run()

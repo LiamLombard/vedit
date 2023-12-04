@@ -4,9 +4,9 @@ Simple windows based gui (could work on linux too - but haven't tested) thrown t
 
 This works by splitting a given video file into many, doing the necessary processing and merging them all back together, then applying a speed modifier.
 
-Splitting up the video into parts to avoid running out of memory.
+Splitting up the video into parts avoids running out of memory (there is likely a way to get around this natively in ffmpeg but I havent found it yet).
 
-We also mask part of the screen which we want to ignore when considering duplicate frames.
+We also mask part of the screen which we want to ignore for better duplicate frame detection.
 
 
 ## Building the executable
@@ -26,12 +26,12 @@ Will save an exe to the dist directory.
 
 Log files stored in same directory as the executable
 
-The output video will be placed in the same directory as the input file with "_processed" appended to the name.
+The output video will be placed in the same directory as the input file called "processed.mkv" appended to the name.
 
 You will require ffmpeg to be available in your path for this to work.
 
-Tested on mkv files, no idea if it'll handle mp4 files.
+Currently only handles .mkv files.
 
 a config.toml file can be placed in the same directory as the executable where you can set the following options:
-* vid_split_secs: how long the split videos should be (to combat out of memory issues)
+* video_split_secs: how long the split videos should be (to combat out of memory issues)
 * speed_multiplier: how much the output video should be sped up by

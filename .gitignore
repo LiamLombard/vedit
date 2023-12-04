@@ -3,3 +3,6 @@
 dist
 build
 .spec
+vids
+logs
+config.toml
