@@ -1,15 +1,17 @@
+from decimal import Decimal
 import subprocess
 from pathlib import Path
 from typing import Iterator
 
 from vedit.logger import get_logger
+from vedit.db import DB
 
 logger = get_logger()
 
 
 class FFmpeg:
-    def ffmpeg(self, *args: str) -> None:
-        cmd = ["ffmpeg", *args]
+    def run(self, *args: str, program: str = "ffmpeg") -> None:
+        cmd = [program, *args]
         logger.writeline(f"Running command: {' '.join(cmd)}")
 
         res = subprocess.run(
@@ -18,13 +20,34 @@ class FFmpeg:
             stderr=logger.out_stream,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
+
         res.check_returncode()
         logger.writeline("ffmpeg finished successfully!")
+
+    def get_video_duration(self, video_file: Path) -> Decimal:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            video_file.as_posix(),
+        ]
+        logger.writeline(f"Running command: {' '.join(cmd)}")
+
+        res = subprocess.run(
+            args=cmd, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        res.check_returncode()
+        logger.writeline("ffprobe finished successfully!")
+        return Decimal(res.stdout.decode())
 
     def split(
         self, in_file: Path, tmp_path: Path, seconds: int, prefix: str = ""
     ) -> list[Path]:
-        self.ffmpeg(
+        self.run(
             "-y",
             "-i",
             in_file.as_posix(),
@@ -42,6 +65,28 @@ class FFmpeg:
         )
         return sorted(tmp_path.glob(f"{prefix}*{in_file.suffix}"), key=lambda f: f.name)
 
+    def cut_section(
+        self, in_file: Path, tmp_path: Path, start_time: Decimal, end_time: Decimal
+    ) -> list[Path]:
+        out_file = tmp_path.joinpath(f"{start_time}-{end_time}{in_file.suffix}")
+        self.run(
+            "-y",
+            "-ss",
+            str(start_time),
+            "-i",
+            in_file.as_posix(),
+            "-c",
+            "copy",
+            "-to",
+            str(end_time),
+            "-map",
+            "0:v",
+            "-reset_timestamps",
+            "1",
+            out_file.as_posix(),
+        )
+        return out_file
+
     def combine_and_speedup(
         self,
         processed_paths: list[Path],
@@ -54,7 +99,7 @@ class FFmpeg:
             "\r\n".join([f"file {f.as_posix()}" for f in processed_paths])
         )
 
-        self.ffmpeg(
+        self.run(
             "-y",
             "-f",
             "concat",
@@ -71,7 +116,7 @@ class FFmpeg:
 
     def dedupe(self, in_file: Path) -> Path:
         output_path = in_file.parent / f"{in_file.stem}_processed{in_file.suffix}"
-        self.ffmpeg(
+        self.run(
             "-y",
             "-i",
             in_file.as_posix(),
@@ -87,32 +132,3 @@ class FFmpeg:
             output_path.as_posix(),
         )
         return output_path
-
-    def edit(
-        self, in_file: Path, seconds: int, min_split_time: int = 1, n_splits: int = 2
-    ) -> Iterator[Path]:
-        """Handles the main deduplication logic for a file.
-
-        This is an error prone action, where we often run out of memory while trying to process 4K video.
-        To try and mitigate we split file into `n_splits` for every failure and try again.
-        Down to a minimum of 1 second per split file.
-        """
-        try:
-            yield self.dedupe(in_file=in_file)
-            return
-        except subprocess.CalledProcessError:
-            logger.exception("Failed to process file - probably ran out of memory.")
-
-        new_time = seconds // n_splits
-        logger.writeline(f"Splitting file length down to {new_time} and retrying...")
-
-        if new_time < min_split_time:
-            raise RuntimeError(
-                "Something has gone wrong, we couldn't process very short videos."
-            )
-
-        files = self.split(
-            in_file, in_file.parent, seconds=new_time, prefix=f"{in_file.name}_"
-        )
-        for file in files:
-            yield from self.edit(in_file=file, seconds=new_time)

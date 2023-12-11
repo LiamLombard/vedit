@@ -1,7 +1,12 @@
 from datetime import datetime
+from decimal import Decimal
+from itertools import chain
 from queue import Queue
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from shutil import rmtree
+import subprocess
+from typing import Iterator
+from vedit.db import DB, EditingTracker
 
 from vedit.logger import get_logger
 from vedit.config import Config
@@ -25,49 +30,75 @@ def parse_filename(p: Path) -> datetime:
     raise RuntimeError("Could not get a meaningful value to order video files by")
 
 
-def process_dir(selected_dir: Path, message_queue: Queue) -> None:
-    config = Config.load()
-    ffmpeg = FFmpeg()
-
+def process_dir(
+    selected_dir: Path,
+    message_queue: Queue,
+    ffmpeg: FFmpeg | None = None,
+    config: Config | None = None,
+    db: DB | None = None,
+) -> None:
+    config = config or Config.load()
     logger.make_new_logfile()
+    tmp_path = selected_dir / ".vedit"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+
+    db = db or DB.create_db(tmp_path / "db.sqlite")
+
+    ffmpeg = ffmpeg or FFmpeg()
 
     output_path = selected_dir / "processed.mkv"
 
+    if output_path.exists():
+        message_queue.put(("skipped", output_path))
+
     files_to_process = sorted(selected_dir.glob("*.mkv"), key=parse_filename)
+    total_duration = sum(map(ffmpeg.get_video_duration, files_to_process))
 
-    n_digits = len(str(len(files_to_process))) + 1
+    for video_file in files_to_process:
+        file_duration: Decimal = ffmpeg.get_video_duration(video_file=video_file)
 
-    with TemporaryDirectory() as tmp_path:
-        tmp_path = Path(tmp_path)
-        tmp_path.mkdir(parents=True, exist_ok=True)
-
-        message_queue.put(("step", 0, "Splitting video files into chunks"))
-        files: list[Path] = []
-        for i, video_file in enumerate(files_to_process):
-            split_files = ffmpeg.split(
-                video_file,
-                tmp_path=tmp_path,
-                seconds=config.video_split_secs,
-                prefix=f"{i:0{n_digits}}_",
-            )
-            files.extend(split_files)
-
-        step = 100 / (len(files) + 2)
-        message_queue.put(("step", step, "Starting to process files"))
-
-        processed_paths = []
-        for i, file in enumerate(files):
-            msg = f"Processing: {file.as_posix()} ({i+1}/{len(files)})"
-            message_queue.put(("step", step, msg))
-            processed_paths.extend(ffmpeg.edit(file, seconds=config.video_split_secs))
-
-        message_queue.put(("step", 0, "Merging/Speeding up files"))
-        ffmpeg.combine_and_speedup(
-            processed_paths,
-            speed_multiplier=config.speed_multiplier,
-            output_path=output_path,
-            tmp_path=tmp_path,
+        vs = EditingTracker(
+            video_file, file_duration, split_time=config.video_split_secs, db=db
         )
-        message_queue.put(("step", step, "Merging Complete"))
+
+        while (current_range := vs.next()) is not None:
+            start_time, end_time = current_range
+            message_queue.put(
+                ("step", 0, f"Cutting out {start_time}s-{end_time}s from {video_file}")
+            )
+            sub_file = ffmpeg.cut_section(
+                video_file, tmp_path=tmp_path, start_time=start_time, end_time=end_time
+            )
+
+            message_queue.put(
+                ("step", 0, f"Processing {start_time}s-{end_time}s of {video_file}")
+            )
+            try:
+                out_file = ffmpeg.dedupe(sub_file)
+            except subprocess.CalledProcessError:
+                sub_file.unlink(missing_ok=True)
+                vs.failed(current_range)
+                continue
+
+            step = 100 * ((end_time - start_time) / (total_duration * Decimal("0.95")))
+            message_queue.put(
+                ("step", step, f"Processing {start_time}s-{end_time}s of {video_file}")
+            )
+            vs.success(out_file, current_range)
+            sub_file.unlink(missing_ok=True)
+
+    processed_paths = chain.from_iterable(map(db.get_merge_order, files_to_process))
+
+    message_queue.put(("step", 0, "Merging/Speeding up files"))
+    ffmpeg.combine_and_speedup(
+        processed_paths,
+        speed_multiplier=config.speed_multiplier,
+        output_path=output_path,
+        tmp_path=tmp_path,
+    )
+    message_queue.put(("step", 5, "Merging Complete"))
 
     message_queue.put(("done", output_path))
+
+    db.close()
+    rmtree(tmp_path)
