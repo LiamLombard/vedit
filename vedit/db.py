@@ -98,6 +98,16 @@ class DB:
         )
         return [(Decimal(s), Decimal(e)) for (s, e) in cursor.fetchall()]
 
+    def get_total_processed_duration(self, source_files: list[Path]) -> Decimal:
+        cursor = self.conn.execute(
+            f"""SELECT SUM(end_time - start_time)
+            FROM process_log
+            WHERE source_file IN ({", ".join( "?"* len(source_files))}) AND status = 'success'""",
+            [s.as_posix() for s in source_files],
+        )
+        ans, *_ = cursor.fetchone()
+        return Decimal(ans)
+
     def get_merge_order(self, source_file: Path) -> list[Path]:
         cursor = self.conn.execute(
             """SELECT output_file

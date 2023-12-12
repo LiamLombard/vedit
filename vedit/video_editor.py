@@ -53,6 +53,15 @@ def process_dir(
 
     files_to_process = sorted(selected_dir.glob("*.mkv"), key=parse_filename)
     total_duration = sum(map(ffmpeg.get_video_duration, files_to_process))
+    total_processed_duration = db.get_total_processed_duration(files_to_process)
+
+    start = 100 * ((total_processed_duration) / (total_duration * Decimal("0.95")))
+    msg = (
+        "Restarting from where we left off"
+        if start != 0
+        else "Commencing video editing"
+    )
+    message_queue.put(("step", start, msg))
 
     for video_file in files_to_process:
         file_duration: Decimal = ffmpeg.get_video_duration(video_file=video_file)
