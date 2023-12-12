@@ -68,7 +68,9 @@ class FFmpeg:
     def cut_section(
         self, in_file: Path, tmp_path: Path, start_time: Decimal, end_time: Decimal
     ) -> list[Path]:
-        out_file = tmp_path.joinpath(f"{start_time}-{end_time}{in_file.suffix}")
+        out_file = tmp_path.joinpath(
+            f"{in_file.stem}-{start_time}s-{end_time}s{in_file.suffix}"
+        )
         self.run(
             "-y",
             "-ss",
@@ -77,12 +79,12 @@ class FFmpeg:
             in_file.as_posix(),
             "-c",
             "copy",
-            "-to",
-            str(end_time),
+            "-t",
+            str(end_time - start_time),
             "-map",
             "0:v",
-            "-reset_timestamps",
-            "1",
+            "-avoid_negative_ts",
+            "make_zero",
             out_file.as_posix(),
         )
         return out_file
@@ -96,7 +98,7 @@ class FFmpeg:
     ) -> Path:
         concat_file = tmp_path / "concat.txt"
         concat_file.write_text(
-            "\r\n".join([f"file {f.as_posix()}" for f in processed_paths])
+            "\r\n".join([f"file '{f.as_posix()}'" for f in processed_paths])
         )
 
         self.run(
@@ -114,8 +116,7 @@ class FFmpeg:
         )
         return output_path
 
-    def dedupe(self, in_file: Path) -> Path:
-        output_path = in_file.parent / f"{in_file.stem}_processed{in_file.suffix}"
+    def dedupe(self, in_file: Path, output_path: Path) -> Path:
         self.run(
             "-y",
             "-i",

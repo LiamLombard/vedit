@@ -106,7 +106,8 @@ class DB:
             [s.as_posix() for s in source_files],
         )
         ans, *_ = cursor.fetchone()
-        return Decimal(ans)
+
+        return Decimal(ans or 0)
 
     def get_merge_order(self, source_file: Path) -> list[Path]:
         cursor = self.conn.execute(

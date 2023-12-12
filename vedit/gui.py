@@ -115,13 +115,22 @@ class VEditGUI:
         self.root.after(1000, self.check_progress)
 
     def check_progress(self) -> None:
-        if self.video_editing_process is None:
+        if (
+            self.video_editing_process is None
+            or self.message_queue.empty()
+            and not self.video_editing_process.is_alive()
+        ):
+            # something has gone wrong...
+            self.status_label.config(
+                text="FFmpeg seems to have failed, please check the logfile for clues."
+            )
+            self.stop_button.config(state=tk.DISABLED)
+            self.root.update()
             return
+
         if self.message_queue.empty() and self.video_editing_process.is_alive():
             self.root.after(1000, self.check_progress)
             return
-        elif self.message_queue.empty() and not self.video_editing_process.is_alive():
-            raise RuntimeError("fmmpeg seems to have failed...")
 
         try:
             message = self.message_queue.get(block=False, timeout=2)

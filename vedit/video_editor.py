@@ -46,16 +46,16 @@ def process_dir(
 
     ffmpeg = ffmpeg or FFmpeg()
 
-    output_path = selected_dir / "processed.mkv"
+    out_path = selected_dir / "processed.mkv"
 
-    if output_path.exists():
-        message_queue.put(("skipped", output_path))
+    if out_path.exists():
+        message_queue.put(("skipped", out_path))
 
     files_to_process = sorted(selected_dir.glob("*.mkv"), key=parse_filename)
     total_duration = sum(map(ffmpeg.get_video_duration, files_to_process))
     total_processed_duration = db.get_total_processed_duration(files_to_process)
 
-    start = 100 * ((total_processed_duration) / (total_duration * Decimal("0.95")))
+    start = 95 * ((total_processed_duration) / (total_duration))
     msg = (
         "Restarting from where we left off"
         if start != 0
@@ -72,42 +72,43 @@ def process_dir(
 
         while (current_range := vs.next()) is not None:
             start_time, end_time = current_range
-            message_queue.put(
-                ("step", 0, f"Cutting out {start_time}s-{end_time}s from {video_file}")
-            )
+            range_str = f"{start_time}s-{end_time}s"
+            message_queue.put(("step", 0, f"Cutting out {range_str} from {video_file}"))
             sub_file = ffmpeg.cut_section(
                 video_file, tmp_path=tmp_path, start_time=start_time, end_time=end_time
             )
 
-            message_queue.put(
-                ("step", 0, f"Processing {start_time}s-{end_time}s of {video_file}")
-            )
+            message_queue.put(("step", 0, f"Processing {range_str} of {video_file}"))
+            out_path = sub_file.parent / f"{sub_file.stem}_processed{sub_file.suffix}"
             try:
-                out_file = ffmpeg.dedupe(sub_file)
+                ffmpeg.dedupe(sub_file, out_path)
             except subprocess.CalledProcessError:
                 sub_file.unlink(missing_ok=True)
+                out_path.unlink(missing_ok=True)
                 vs.failed(current_range)
                 continue
 
-            step = 100 * ((end_time - start_time) / (total_duration * Decimal("0.95")))
+            step = 95 * ((end_time - start_time) / (total_duration))
             message_queue.put(
                 ("step", step, f"Processing {start_time}s-{end_time}s of {video_file}")
             )
-            vs.success(out_file, current_range)
+            vs.success(out_path, current_range)
             sub_file.unlink(missing_ok=True)
 
-    processed_paths = chain.from_iterable(map(db.get_merge_order, files_to_process))
+    processed_paths = list(
+        chain.from_iterable(map(db.get_merge_order, files_to_process))
+    )
 
     message_queue.put(("step", 0, "Merging/Speeding up files"))
     ffmpeg.combine_and_speedup(
         processed_paths,
         speed_multiplier=config.speed_multiplier,
-        output_path=output_path,
+        output_path=out_path,
         tmp_path=tmp_path,
     )
     message_queue.put(("step", 5, "Merging Complete"))
 
-    message_queue.put(("done", output_path))
+    message_queue.put(("done", out_path))
 
     db.close()
     rmtree(tmp_path)
